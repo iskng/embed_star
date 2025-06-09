@@ -1,8 +1,8 @@
 use crate::{
     models::Repo,
     pool::Pool,
+    error::{EmbedError, Result},
 };
-use anyhow::Result;
 use surrealdb::sql::Thing;
 use tracing::{debug, error, info, warn};
 
@@ -50,7 +50,9 @@ impl SurrealClient {
             }
             None => {
                 warn!("Failed to update embedding for repo {:?}", repo_id);
-                Err(anyhow::anyhow!("Failed to update repo"))
+                Err(EmbedError::Database(surrealdb::Error::Db(surrealdb::error::Db::RecordExists {
+                    thing: repo_id.to_string(),
+                })))
             }
         }
     }

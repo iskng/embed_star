@@ -130,3 +130,141 @@ RUST_LOG=warn,embed_star=info cargo run
 - `POOL_SIZE`: Database connection pool size
 - `BATCH_DELAY_MS`: Delay between batches to avoid overload
 - `RETRY_ATTEMPTS`: Number of retries for failed embeddings
+
+## Production Deployment
+
+### Health Monitoring
+
+The service exposes the following endpoints on port 9090:
+- `/health` - Health check endpoint with database connectivity status
+- `/metrics` - Prometheus metrics endpoint
+- `/livez` - Kubernetes liveness probe endpoint
+
+### Metrics
+
+Key metrics exposed:
+- `embed_star_embeddings_total` - Total embeddings generated
+- `embed_star_embeddings_errors_total` - Total embedding errors
+- `embed_star_embedding_duration_seconds` - Embedding generation time
+- `embed_star_repos_pending` - Number of repos pending embeddings
+- `embed_star_rate_limits_total` - Rate limit hits by provider
+
+### Docker Deployment
+
+```bash
+# Build the image
+docker build -t embed_star:latest .
+
+# Run with environment variables
+docker run -d \
+  --name embed_star \
+  -p 9090:9090 \
+  --env-file .env.production \
+  embed_star:latest
+```
+
+### Docker Compose
+
+For a complete stack with monitoring:
+
+```bash
+docker-compose up -d
+```
+
+This starts:
+- embed_star service
+- SurrealDB
+- Ollama (for local embeddings)
+- Prometheus (metrics collection)
+- Grafana (visualization on port 3000)
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embed-star
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: embed-star
+  template:
+    metadata:
+      labels:
+        app: embed-star
+    spec:
+      containers:
+      - name: embed-star
+        image: your-registry/embed_star:latest
+        ports:
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: DB_URL
+          value: "ws://surrealdb:8000"
+        - name: EMBEDDING_PROVIDER
+          value: "together"
+        envFrom:
+        - secretRef:
+            name: embed-star-secrets
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+```
+
+### Production Best Practices
+
+1. **Security**
+   - Store API keys in secrets management (Kubernetes Secrets, AWS Secrets Manager, etc.)
+   - Run as non-root user (already configured in Dockerfile)
+   - Use TLS for database connections in production
+
+2. **Reliability**
+   - Deploy multiple replicas for high availability
+   - Configure appropriate resource limits
+   - Use persistent storage for SurrealDB
+   - Set up alerting on key metrics
+
+3. **Performance**
+   - Tune batch size based on your workload
+   - Monitor rate limits and adjust accordingly
+   - Use local Ollama for cost-effective embeddings at scale
+   - Consider regional deployments near your database
+
+4. **Observability**
+   - Export logs to centralized logging (ELK, Datadog, etc.)
+   - Set up dashboards for key metrics
+   - Configure alerts for error rates and processing delays
+   - Use distributed tracing for debugging
+
+### CI/CD
+
+GitHub Actions workflows are included for:
+- Continuous Integration (lint, test, build)
+- Security audits
+- Docker image building
+- Release automation with multi-platform binaries
+
+To create a release:
+```bash
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+```

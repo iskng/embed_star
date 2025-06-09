@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  embed_star:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: embed_star
+    environment:
+      # Database configuration
+      DB_URL: ws://surrealdb:8000
+      DB_USER: root
+      DB_PASS: root
+      DB_NAMESPACE: gitstars
+      DB_DATABASE: stars
+      
+      # Embedding configuration
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      
+      # Processing configuration
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      POOL_SIZE: ${POOL_SIZE:-10}
+      
+      # Logging
+      RUST_LOG: ${RUST_LOG:-warn,embed_star=info}
+    ports:
+      - "9090:9090"  # Monitoring port
+    depends_on:
+      - surrealdb
+    restart: unless-stopped
+    networks:
+      - embed_star_network
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: surrealdb
+    command: start --user root --pass root --bind 0.0.0.0:8000 file:/data/database.db
+    volumes:
+      - surrealdb_data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - embed_star_network
+
+  # Optional: Ollama for local embeddings
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    networks:
+      - embed_star_network
+    # Pull the embedding model on startup
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "ollama serve & 
+       sleep 5 && 
+       ollama pull nomic-embed-text && 
+       wait"
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9091:9090"
+    restart: unless-stopped
+    networks:
+      - embed_star_network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - embed_star_network
+
+volumes:
+  surrealdb_data:
+  ollama_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  embed_star_network:
+    driver: bridge

@@ -48,6 +48,9 @@ pub struct Config {
 
     #[arg(long, env = "BATCH_DELAY_MS", default_value = "100")]
     pub batch_delay_ms: u64,
+
+    #[arg(long, env = "MONITORING_PORT", default_value = "9090")]
+    pub monitoring_port: Option<u16>,
 }
 
 impl Config {
