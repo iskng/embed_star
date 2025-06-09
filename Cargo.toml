@@ -1,0 +1,29 @@
+[package]
+name = "embed_star"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies matching main project
+tokio = { version = "1.35", features = ["full"] }
+surrealdb = { version = "1.5", features = ["protocol-ws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# For embeddings
+ollama-rs = "0.2"
+async-openai = "0.20"
+# For Together AI (using REST API)
+reqwest = { version = "0.11", features = ["json"] }
+
+# Environment and CLI
+dotenv = "0.15"
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# For futures and async traits
+futures = "0.3"
+async-trait = "0.1"
