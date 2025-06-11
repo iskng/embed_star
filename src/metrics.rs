@@ -13,6 +13,8 @@ pub struct Metrics {
     pub provider_requests: CounterVec,
     pub rate_limits: CounterVec,
     pub active_connections: IntGaugeVec,
+    pub circuit_breaker_state: IntGaugeVec,
+    pub retry_attempts: CounterVec,
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -53,6 +55,14 @@ impl Metrics {
                 prometheus::opts!("embed_star_active_connections", "Number of active connections"),
                 &["type"]
             )?,
+            circuit_breaker_state: register_int_gauge_vec!(
+                prometheus::opts!("embed_star_circuit_breaker_state", "Circuit breaker state (0=closed, 1=open, 2=half-open)"),
+                &["service"]
+            )?,
+            retry_attempts: register_counter_vec!(
+                prometheus::opts!("embed_star_retry_attempts_total", "Total retry attempts"),
+                &["operation"]
+            )?,
         })
     }
     
@@ -67,6 +77,8 @@ impl Metrics {
         registry.register(Box::new(metrics.provider_requests.clone()))?;
         registry.register(Box::new(metrics.rate_limits.clone()))?;
         registry.register(Box::new(metrics.active_connections.clone()))?;
+        registry.register(Box::new(metrics.circuit_breaker_state.clone()))?;
+        registry.register(Box::new(metrics.retry_attempts.clone()))?;
         
         METRICS.set(metrics).map_err(|_| prometheus::Error::Msg("Metrics already initialized".to_string()))?;
         Ok(())
@@ -108,4 +120,20 @@ pub fn set_pending_repos(count: i64) {
 pub fn update_active_connections(conn_type: &str, delta: i64) {
     let metrics = Metrics::get();
     metrics.active_connections.with_label_values(&[conn_type]).add(delta);
+}
+
+pub fn record_circuit_breaker_state(service: &str, state: &str) {
+    let metrics = Metrics::get();
+    let value = match state {
+        "closed" => 0,
+        "open" => 1,
+        "half_open" => 2,
+        _ => 0,
+    };
+    metrics.circuit_breaker_state.with_label_values(&[service]).set(value);
+}
+
+pub fn record_retry(operation: &str) {
+    let metrics = Metrics::get();
+    metrics.retry_attempts.with_label_values(&[operation]).inc();
 }

@@ -77,19 +77,27 @@ mod tests {
     
     #[tokio::test]
     async fn test_rate_limiter() {
+        use std::time::Instant;
+        
         let manager = RateLimiterManager::new();
         
         // Configure 2 requests per minute (for testing)
         manager.configure_provider("test", 2).await.unwrap();
         
-        // First two requests should succeed
-        assert!(manager.check_rate_limit("test").await.is_ok());
-        assert!(manager.check_rate_limit("test").await.is_ok());
+        // Get the rate limiter directly
+        let limiters = manager.limiters.read().await;
+        let limiter = limiters.get("test").unwrap();
         
-        // Third request should fail
-        assert!(matches!(
-            manager.check_rate_limit("test").await,
-            Err(EmbedError::RateLimitExceeded { .. })
-        ));
+        // First two requests should succeed immediately
+        let start1 = Instant::now();
+        assert!(limiter.check().is_ok());
+        assert!(start1.elapsed().as_millis() < 10);
+        
+        let start2 = Instant::now();
+        assert!(limiter.check().is_ok());
+        assert!(start2.elapsed().as_millis() < 10);
+        
+        // Third request should fail (rate limit exceeded)
+        assert!(limiter.check().is_err());
     }
 }

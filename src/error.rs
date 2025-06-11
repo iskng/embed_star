@@ -23,6 +23,9 @@ pub enum EmbedError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
     
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+    
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -49,6 +52,7 @@ impl EmbedError {
             EmbedError::RateLimitExceeded { .. } => "RATE_LIMIT",
             EmbedError::InvalidDimension { .. } => "INVALID_DIMENSION",
             EmbedError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
+            EmbedError::ValidationError(_) => "VALIDATION_ERROR",
             EmbedError::Internal(_) => "INTERNAL_ERROR",
         }
     }

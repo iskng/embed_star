@@ -8,12 +8,13 @@ use axum::{
 use prometheus::{Encoder, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use crate::pool::Pool;
+use crate::{deduplication::DeduplicationManager, pool::Pool};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: Pool,
     pub registry: Arc<Registry>,
+    pub deduplication: Option<Arc<DeduplicationManager>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -22,6 +23,7 @@ pub struct HealthResponse {
     pub version: String,
     pub database: DatabaseHealth,
     pub embedding_providers: Vec<ProviderHealth>,
+    pub processing_locks: Option<ProcessingLocksHealth>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,6 +39,12 @@ pub struct ProviderHealth {
     pub latency_ms: Option<u64>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ProcessingLocksHealth {
+    pub active_locks: usize,
+    pub instance_id: String,
+}
+
 pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthResponse>, StatusCode> {
     // Check database health
     let db_start = std::time::Instant::now();
@@ -46,6 +54,19 @@ pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthRe
     };
     let db_latency = db_start.elapsed().as_millis() as u64;
     
+    // Check processing locks if available
+    let processing_locks = if let Some(dedup) = &state.deduplication {
+        match dedup.get_active_locks_count().await {
+            Ok(count) => Some(ProcessingLocksHealth {
+                active_locks: count,
+                instance_id: "embed_star".to_string(), // We could expose instance ID from dedup manager
+            }),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let health = HealthResponse {
         status: if db_connected { "healthy".to_string() } else { "unhealthy".to_string() },
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -54,6 +75,7 @@ pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthRe
             latency_ms: Some(db_latency),
         },
         embedding_providers: vec![], // TODO: Check provider health
+        processing_locks,
     };
     
     if db_connected {

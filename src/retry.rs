@@ -40,6 +40,7 @@ where
     };
     
     let mut retry_count = 0;
+    #[allow(unused_assignments)]
     let mut last_error: Option<EmbedError> = None;
     
     loop {

@@ -1,4 +1,7 @@
+pub mod circuit_breaker;
+pub mod cleanup;
 pub mod config;
+pub mod deduplication;
 pub mod embedder;
 pub mod error;
 pub mod metrics;
@@ -10,3 +13,4 @@ pub mod retry;
 pub mod server;
 pub mod shutdown;
 pub mod surreal_client;
+pub mod validation;

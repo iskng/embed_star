@@ -46,6 +46,9 @@ governor = "0.6"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 backoff = { version = "0.4", features = ["tokio"] }
 
+# High priority robustness features
+parking_lot = "0.12"
+
 [dev-dependencies]
 mockall = "0.12"
 tokio-test = "0.4"
