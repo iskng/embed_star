@@ -3,7 +3,7 @@ use crate::{
     deduplication::{DeduplicationManager, LockGuard},
     embedder::Embedder,
     embedding_cache::EmbeddingCache,
-    error,
+    error::EmbedError,
     metrics,
     models::Repo,
     rate_limiter::RateLimiterManager,
@@ -14,7 +14,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 pub async fn process_batch(
@@ -107,7 +107,7 @@ pub async fn process_batch(
                 retry_config,
                 || async {
                     embedder.generate_embedding(&text).await
-                        .map_err(|e| error::EmbedError::EmbeddingProvider(e.to_string()))
+                        .map_err(|e| EmbedError::EmbeddingProvider(e.to_string()))
                 },
             ).await
         );
