@@ -51,6 +51,9 @@ pub struct Config {
 
     #[arg(long, env = "MONITORING_PORT", default_value = "9090")]
     pub monitoring_port: Option<u16>,
+
+    #[arg(long, env = "PARALLEL_WORKERS", default_value = "3")]
+    pub parallel_workers: usize,
 }
 
 impl Config {
@@ -70,6 +73,10 @@ impl Config {
 
         if self.pool_size == 0 {
             anyhow::bail!("Pool size must be greater than 0");
+        }
+
+        if self.parallel_workers == 0 {
+            anyhow::bail!("Parallel workers must be greater than 0");
         }
 
         Ok(())

@@ -3,11 +3,14 @@ mod cleanup;
 mod config;
 mod deduplication;
 mod embedder;
+mod embedding_cache;
 mod error;
 mod metrics;
 mod migration;
 mod models;
 mod pool;
+mod pool_metrics;
+mod process_batch;
 mod rate_limiter;
 mod retry;
 mod server;
@@ -19,15 +22,18 @@ use crate::{
     circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager},
     cleanup::cleanup_locks_loop,
     config::Config,
-    deduplication::{DeduplicationManager, LockGuard},
+    deduplication::DeduplicationManager,
     embedder::Embedder,
+    embedding_cache::{cache_cleanup_task, EmbeddingCache},
     error::Result,
     metrics::Metrics,
     migration::run_migrations,
     models::Repo,
     pool::create_pool,
+    pool_metrics::monitor_pool_metrics,
+    process_batch::process_batch,
     rate_limiter::RateLimiterManager,
-    retry::{with_retry, RetryConfig},
+    retry::RetryConfig,
     server::{run_monitoring_server, AppState},
     shutdown::{setup_signal_handlers, GracefulShutdown, ShutdownController},
     surreal_client::SurrealClient,
@@ -39,7 +45,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{interval, sleep, Instant},
+    time::{interval, sleep},
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -91,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let deduplication = Arc::new(DeduplicationManager::new(pool.clone()));
     let circuit_breaker = Arc::new(CircuitBreakerManager::new());
     let validator = Arc::new(EmbeddingValidator::new(ValidationConfig::default()));
+    let cache = Arc::new(EmbeddingCache::new(10_000, 3600)); // 10k entries, 1 hour TTL
 
     // Configure circuit breakers for each provider
     match config.embedding_provider.as_str() {
@@ -159,8 +166,8 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_controller, _) = ShutdownController::new();
     let mut graceful_shutdown = GracefulShutdown::new(shutdown_controller.clone());
 
-    // Create processing channel
-    let (tx, rx) = mpsc::channel::<Repo>(config.batch_size * 2);
+    // Create processing channel with larger buffer for parallel workers
+    let (tx, rx) = mpsc::channel::<Repo>(config.batch_size * config.parallel_workers * 2);
 
     // Start monitoring server
     let monitoring_addr = format!("0.0.0.0:{}", config.monitoring_port.unwrap_or(9090));
@@ -187,32 +194,45 @@ async fn main() -> anyhow::Result<()> {
     });
     graceful_shutdown.register_task("monitoring_server".to_string(), monitoring_handle);
 
-    // Start batch processor
-    let batch_processor = tokio::spawn({
-        let client = client.clone();
-        let embedder = embedder.clone();
-        let config = config.clone();
-        let rate_limiter = rate_limiter.clone();
-        let deduplication = deduplication.clone();
-        let circuit_breaker = circuit_breaker.clone();
-        let validator = validator.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
-        
-        async move {
-            process_batch_loop(
-                rx,
-                client,
-                embedder,
-                config,
-                rate_limiter,
-                deduplication,
-                circuit_breaker,
-                validator,
-                shutdown_rx,
-            ).await;
-        }
-    });
-    graceful_shutdown.register_task("batch_processor".to_string(), batch_processor);
+    // Create shared receiver wrapped in Arc<Mutex> for multiple workers
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+    // Start multiple batch processor workers
+    for worker_id in 0..config.parallel_workers {
+        let batch_processor = tokio::spawn({
+            let rx = rx.clone();
+            let client = client.clone();
+            let embedder = embedder.clone();
+            let config = config.clone();
+            let rate_limiter = rate_limiter.clone();
+            let deduplication = deduplication.clone();
+            let circuit_breaker = circuit_breaker.clone();
+            let validator = validator.clone();
+            let cache = cache.clone();
+            let mut shutdown_rx = shutdown_receiver.subscribe();
+            
+            async move {
+                info!("Starting batch processor worker {}", worker_id);
+                process_batch_loop_worker(
+                    worker_id,
+                    rx,
+                    client,
+                    embedder,
+                    config,
+                    rate_limiter,
+                    deduplication,
+                    circuit_breaker,
+                    validator,
+                    cache,
+                    shutdown_rx,
+                ).await;
+            }
+        });
+        graceful_shutdown.register_task(
+            format!("batch_processor_{}", worker_id),
+            batch_processor,
+        );
+    }
 
     // Start initial batch processor
     let initial_processor = tokio::spawn({
@@ -262,6 +282,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     graceful_shutdown.register_task("lock_cleanup".to_string(), lock_cleanup);
+
+    // Start pool metrics monitor
+    let pool_monitor = tokio::spawn({
+        let pool = pool.clone();
+        let mut shutdown_rx = shutdown_receiver.subscribe();
+        
+        async move {
+            monitor_pool_metrics(pool, shutdown_rx).await;
+        }
+    });
+    graceful_shutdown.register_task("pool_monitor".to_string(), pool_monitor);
+
+    // Start cache cleanup task
+    let cache_cleanup = tokio::spawn({
+        let cache = cache.clone();
+        let mut shutdown_rx = shutdown_receiver.subscribe();
+        
+        async move {
+            cache_cleanup_task(cache, shutdown_rx).await;
+        }
+    });
+    graceful_shutdown.register_task("cache_cleanup".to_string(), cache_cleanup);
 
     // Wait for shutdown signal
     shutdown_receiver.wait_for_shutdown().await;
@@ -360,8 +402,9 @@ async fn process_live_query(
     Ok(())
 }
 
-async fn process_batch_loop(
-    mut rx: mpsc::Receiver<Repo>,
+async fn process_batch_loop_worker(
+    worker_id: usize,
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Repo>>>,
     client: Arc<SurrealClient>,
     embedder: Arc<Embedder>,
     config: Arc<Config>,
@@ -369,6 +412,7 @@ async fn process_batch_loop(
     deduplication: Arc<DeduplicationManager>,
     circuit_breaker: Arc<CircuitBreakerManager>,
     validator: Arc<EmbeddingValidator>,
+    cache: Arc<EmbeddingCache>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut batch = Vec::with_capacity(config.batch_size);
@@ -378,23 +422,27 @@ async fn process_batch_loop(
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                info!("Batch processor received shutdown signal");
+                info!("Worker {} received shutdown signal", worker_id);
                 if !batch.is_empty() {
-                    info!("Processing final batch of {} repos", batch.len());
-                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &retry_config).await;
+                    info!("Worker {} processing final batch of {} repos", worker_id, batch.len());
+                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &cache, &retry_config).await;
                 }
                 break;
             }
-            Some(repo) = rx.recv() => {
-                batch.push(repo);
-                if batch.len() >= config.batch_size {
-                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &retry_config).await;
-                    batch.clear();
-                }
-            }
             _ = interval.tick() => {
+                // Try to fill the batch
+                let mut rx_guard = rx.lock().await;
+                while batch.len() < config.batch_size {
+                    match rx_guard.try_recv() {
+                        Ok(repo) => batch.push(repo),
+                        Err(_) => break,
+                    }
+                }
+                drop(rx_guard);
+
                 if !batch.is_empty() {
-                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &retry_config).await;
+                    debug!("Worker {} processing batch of {} repos", worker_id, batch.len());
+                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &cache, &retry_config).await;
                     batch.clear();
                 }
             }
@@ -402,141 +450,6 @@ async fn process_batch_loop(
     }
 }
 
-async fn process_batch(
-    batch: &[Repo],
-    client: &Arc<SurrealClient>,
-    embedder: &Arc<Embedder>,
-    rate_limiter: &Arc<RateLimiterManager>,
-    deduplication: &Arc<DeduplicationManager>,
-    circuit_breaker: &Arc<CircuitBreakerManager>,
-    validator: &Arc<EmbeddingValidator>,
-    retry_config: &RetryConfig,
-) {
-    let batch_id = Uuid::new_v4();
-    info!(
-        batch_id = %batch_id,
-        batch_size = batch.len(),
-        "Processing batch"
-    );
-
-    for repo in batch {
-        let span = tracing::info_span!(
-            "process_repo",
-            repo_id = %repo.id,
-            repo_name = %repo.full_name,
-            batch_id = %batch_id
-        );
-        let _enter = span.enter();
-
-        // Try to acquire lock for this repository
-        match deduplication.try_acquire_lock(&repo.id).await {
-            Ok(true) => {
-                // Lock acquired, proceed with processing
-                debug!("Acquired lock for repo {}", repo.full_name);
-            }
-            Ok(false) => {
-                // Another instance is processing this repo
-                debug!("Repo {} is being processed by another instance", repo.full_name);
-                continue;
-            }
-            Err(e) => {
-                error!("Failed to check lock for repo {}: {}", repo.full_name, e);
-                continue;
-            }
-        }
-
-        // Create lock guard for automatic cleanup
-        let lock_guard = LockGuard::new(deduplication, repo.id.clone());
-
-        let text = repo.prepare_text_for_embedding();
-        let provider = embedder.model_name();
-        
-        // Check rate limit
-        if let Err(e) = rate_limiter.wait_for_permit(provider).await {
-            error!("Rate limit error: {}", e);
-            continue;
-        }
-        
-        let start = Instant::now();
-        
-        let embedding_result = with_circuit_breaker!(
-            circuit_breaker,
-            provider,
-            with_retry(
-                &format!("generate_embedding_{}", repo.full_name),
-                retry_config,
-                || async {
-                    embedder.generate_embedding(&text).await
-                        .map_err(|e| error::EmbedError::EmbeddingProvider(e.to_string()))
-                },
-            ).await
-        );
-        
-        match embedding_result {
-            Ok(mut embedding) => {
-                let duration = start.elapsed().as_secs_f64();
-                
-                // Validate the embedding
-                match validator.validate(&embedding, &repo.full_name) {
-                    Ok(_) => {
-                        metrics::record_embedding_generated(provider, embedder.model_name(), duration);
-                        metrics::record_provider_request(provider, true);
-                    }
-                    Err(e) => {
-                        error!("Embedding validation failed for {}: {}", repo.full_name, e);
-                        metrics::record_embedding_error(provider, "validation_failed");
-                        // Release lock with failure status
-                        if let Err(e) = lock_guard.release("failed").await {
-                            error!("Failed to release lock: {}", e);
-                        }
-                        continue;
-                    }
-                }
-                
-                let update_result = with_retry(
-                    &format!("update_embedding_{}", repo.full_name),
-                    retry_config,
-                    || async {
-                        client
-                            .update_repo_embedding(&repo.id, embedding.clone(), embedder.model_name())
-                            .await
-                    },
-                ).await;
-                
-                match update_result {
-                    Ok(_) => {
-                        info!(
-                            duration_ms = duration * 1000.0,
-                            embedding_size = embedding.len(),
-                            "Successfully generated embedding"
-                        );
-                        // Release lock with success status
-                        if let Err(e) = lock_guard.release("completed").await {
-                            error!("Failed to release lock: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to update embedding: {}", e);
-                        metrics::record_embedding_error(provider, e.error_code());
-                        // Release lock with failure status
-                        if let Err(e) = lock_guard.release("failed").await {
-                            error!("Failed to release lock: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to generate embedding: {}", e);
-                metrics::record_embedding_error(provider, e.error_code());
-                metrics::record_provider_request(provider, false);
-                // Release lock with failure status
-                if let Err(e) = lock_guard.release("failed").await {
-                    error!("Failed to release lock: {}", e);
-                }
-            }
-        }
-    }
-}
 
 async fn report_stats_loop(
     client: Arc<SurrealClient>,

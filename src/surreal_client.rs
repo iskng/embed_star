@@ -5,6 +5,7 @@ use crate::{
 };
 use surrealdb::sql::Thing;
 use tracing::{debug, error, info, warn};
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct SurrealClient {
@@ -142,4 +143,112 @@ impl SurrealClient {
         let result: Option<usize> = db.query(query).await?.take(0)?;
         Ok(result.unwrap_or(0))
     }
+
+    /// Batch update multiple repository embeddings in a single transaction
+    pub async fn batch_update_embeddings(
+        &self,
+        updates: Vec<EmbeddingUpdate>,
+    ) -> Result<BatchUpdateResult> {
+        if updates.is_empty() {
+            return Ok(BatchUpdateResult::default());
+        }
+
+        let start = Instant::now();
+        let db = self.pool.clone();
+        let batch_size = updates.len();
+
+        // Build a transaction with all updates
+        let mut query = String::from("BEGIN TRANSACTION;");
+        
+        for (idx, update) in updates.iter().enumerate() {
+            query.push_str(&format!(
+                r#"
+                UPDATE {} SET
+                    embedding = $embedding_{},
+                    embedding_model = $model_{},
+                    embedding_generated_at = time::now();
+                "#,
+                update.repo_id, idx, idx
+            ));
+        }
+        
+        query.push_str("COMMIT TRANSACTION;");
+
+        // Bind all parameters
+        let mut statement = db.query(&query);
+        for (idx, update) in updates.iter().enumerate() {
+            statement = statement
+                .bind((format!("embedding_{}", idx), update.embedding.clone()))
+                .bind((format!("model_{}", idx), update.model.clone()));
+        }
+
+        // Execute the batch update
+        match statement.await {
+            Ok(_) => {
+                let duration = start.elapsed();
+                info!(
+                    "Batch updated {} embeddings in {:?} ({:.2} updates/sec)",
+                    batch_size,
+                    duration,
+                    batch_size as f64 / duration.as_secs_f64()
+                );
+                
+                Ok(BatchUpdateResult {
+                    total: batch_size,
+                    successful: batch_size,
+                    failed: 0,
+                    duration,
+                })
+            }
+            Err(e) => {
+                error!("Batch update failed: {}", e);
+                // Fall back to individual updates
+                self.fallback_individual_updates(updates).await
+            }
+        }
+    }
+
+    /// Fallback to individual updates if batch update fails
+    async fn fallback_individual_updates(
+        &self,
+        updates: Vec<EmbeddingUpdate>,
+    ) -> Result<BatchUpdateResult> {
+        let start = Instant::now();
+        let mut successful = 0;
+        let mut failed = 0;
+
+        for update in updates {
+            match self.update_repo_embedding(&update.repo_id, update.embedding, &update.model).await {
+                Ok(_) => successful += 1,
+                Err(e) => {
+                    error!("Failed to update embedding for {:?}: {}", update.repo_id, e);
+                    failed += 1;
+                }
+            }
+        }
+
+        Ok(BatchUpdateResult {
+            total: successful + failed,
+            successful,
+            failed,
+            duration: start.elapsed(),
+        })
+    }
+}
+
+/// Represents a single embedding update
+#[derive(Debug, Clone)]
+pub struct EmbeddingUpdate {
+    pub repo_id: Thing,
+    pub embedding: Vec<f32>,
+    pub model: String,
+}
+
+/// Result of a batch update operation
+#[derive(Debug, Default)]
+pub struct BatchUpdateResult {
+    pub total: usize,
+    pub successful: usize,
+    pub failed: usize,
+    pub duration: std::time::Duration,
 }
