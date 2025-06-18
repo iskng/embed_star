@@ -1,5 +1,5 @@
 use embed_star::config::Config;
-use embed_star::models::{Repo, RepoOwner};
+use embed_star::models::{ Repo, RepoOwner };
 use embed_star::error::EmbedError;
 use chrono::Utc;
 use surrealdb::sql::Thing;
@@ -8,7 +8,7 @@ use surrealdb::sql::Thing;
 fn test_repo_needs_embedding() {
     let now = Utc::now();
     let earlier = now - chrono::Duration::hours(1);
-    
+
     let repo = Repo {
         id: Thing::from(("repo", "test/repo")),
         github_id: 123,
@@ -29,25 +29,25 @@ fn test_repo_needs_embedding() {
         embedding_model: None,
         embedding_generated_at: None,
     };
-    
+
     assert!(repo.needs_embedding());
-    
+
     let repo_with_embedding = Repo {
         embedding: Some(vec![0.1, 0.2, 0.3]),
         embedding_model: Some("test-model".to_string()),
         embedding_generated_at: Some(earlier),
         ..repo.clone()
     };
-    
+
     // Should need embedding because updated_at > embedding_generated_at
     assert!(repo_with_embedding.needs_embedding());
-    
+
     let repo_up_to_date = Repo {
         updated_at: earlier,
         embedding_generated_at: Some(now),
         ..repo_with_embedding
     };
-    
+
     // Should not need embedding
     assert!(!repo_up_to_date.needs_embedding());
 }
@@ -74,7 +74,7 @@ fn test_prepare_text_for_embedding() {
         embedding_model: None,
         embedding_generated_at: None,
     };
-    
+
     let text = repo.prepare_text_for_embedding();
     assert!(text.contains("Repository: rust-lang/rust"));
     assert!(text.contains("Description: The Rust programming language"));
@@ -86,10 +86,10 @@ fn test_prepare_text_for_embedding() {
 #[test]
 fn test_error_retryable() {
     assert!(EmbedError::ServiceUnavailable("test".to_string()).is_retryable());
-    assert!(EmbedError::RateLimitExceeded { provider: "test".to_string() }.is_retryable());
-    
+    assert!((EmbedError::RateLimitExceeded { provider: "test".to_string() }).is_retryable());
+
     assert!(!EmbedError::Configuration("test".to_string()).is_retryable());
-    assert!(!EmbedError::InvalidDimension { expected: 100, actual: 50 }.is_retryable());
+    assert!(!(EmbedError::InvalidDimension { expected: 100, actual: 50 }).is_retryable());
 }
 
 #[test]
@@ -111,22 +111,23 @@ fn test_config_validation() {
         retry_delay_ms: 1000,
         batch_delay_ms: 100,
         monitoring_port: Some(9090),
+        parallel_workers: 3,
     };
-    
+
     // Should fail - OpenAI provider without API key
     assert!(config.validate().is_err());
-    
+
     config.openai_api_key = Some("sk-test".to_string());
     assert!(config.validate().is_ok());
-    
+
     // Test Together AI validation
     config.embedding_provider = "together".to_string();
     config.together_api_key = None;
     assert!(config.validate().is_err());
-    
+
     config.together_api_key = Some("test-key".to_string());
     assert!(config.validate().is_ok());
-    
+
     // Test batch size validation
     config.batch_size = 0;
     assert!(config.validate().is_err());
