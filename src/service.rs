@@ -1,8 +1,6 @@
 use crate::{
     circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager},
-    cleanup::cleanup_locks_loop,
     config::Config,
-    deduplication::DeduplicationManager,
     embedder::Embedder,
     embedding_cache::{cache_cleanup_task, EmbeddingCache},
     error::Result,
@@ -56,7 +54,6 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     let client = Arc::new(SurrealClient::new(pool.clone()));
     let embedder = Arc::new(Embedder::new(config.clone())?);
     let rate_limiter = Arc::new(RateLimiterManager::new());
-    let deduplication = Arc::new(DeduplicationManager::new(pool.clone()));
     let circuit_breaker = Arc::new(CircuitBreakerManager::new());
     let validator = Arc::new(EmbeddingValidator::new(ValidationConfig::default()));
     let cache = Arc::new(EmbeddingCache::new(10_000, 3600)); // 10k entries, 1 hour TTL
@@ -131,7 +128,6 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     let app_state = AppState {
         db_pool: pool.clone(),
         registry: registry.clone(),
-        deduplication: Some(deduplication.clone()),
     };
     
     let monitoring_handle: JoinHandle<()> = tokio::spawn({
@@ -162,11 +158,10 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
             let embedder = embedder.clone();
             let config = config.clone();
             let rate_limiter = rate_limiter.clone();
-            let deduplication = deduplication.clone();
             let circuit_breaker = circuit_breaker.clone();
             let validator = validator.clone();
             let cache = cache.clone();
-            let mut shutdown_rx = shutdown_receiver.subscribe();
+            let shutdown_rx = shutdown_receiver.subscribe();
             
             async move {
                 info!("Starting batch processor worker {}", worker_id);
@@ -177,7 +172,6 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
                     embedder,
                     config,
                     rate_limiter,
-                    deduplication,
                     circuit_breaker,
                     validator,
                     cache,
@@ -195,7 +189,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     let initial_processor = tokio::spawn({
         let client = client.clone();
         let tx = tx.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
+        let shutdown_rx = shutdown_receiver.subscribe();
         
         async move {
             if let Err(e) = process_initial_batch(&client, &tx, shutdown_rx).await {
@@ -208,7 +202,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     // Start live query processor
     let live_query_processor = tokio::spawn({
         let client = client.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
+        let shutdown_rx = shutdown_receiver.subscribe();
         
         async move {
             if let Err(e) = process_live_query(client, tx, shutdown_rx).await {
@@ -221,7 +215,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     // Start statistics reporter
     let stats_reporter = tokio::spawn({
         let client = client.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
+        let shutdown_rx = shutdown_receiver.subscribe();
         
         async move {
             report_stats_loop(client, shutdown_rx).await;
@@ -229,21 +223,11 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     });
     graceful_shutdown.register_task("stats_reporter".to_string(), stats_reporter);
 
-    // Start lock cleanup task
-    let lock_cleanup = tokio::spawn({
-        let deduplication = deduplication.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
-        
-        async move {
-            cleanup_locks_loop(deduplication, shutdown_rx).await;
-        }
-    });
-    graceful_shutdown.register_task("lock_cleanup".to_string(), lock_cleanup);
 
     // Start pool metrics monitor
     let pool_monitor = tokio::spawn({
         let pool = pool.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
+        let shutdown_rx = shutdown_receiver.subscribe();
         
         async move {
             monitor_pool_metrics(pool, shutdown_rx).await;
@@ -254,7 +238,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     // Start cache cleanup task
     let cache_cleanup = tokio::spawn({
         let cache = cache.clone();
-        let mut shutdown_rx = shutdown_receiver.subscribe();
+        let shutdown_rx = shutdown_receiver.subscribe();
         
         async move {
             cache_cleanup_task(cache, shutdown_rx).await;
@@ -366,7 +350,6 @@ async fn process_batch_loop_worker(
     embedder: Arc<Embedder>,
     config: Arc<Config>,
     rate_limiter: Arc<RateLimiterManager>,
-    deduplication: Arc<DeduplicationManager>,
     circuit_breaker: Arc<CircuitBreakerManager>,
     validator: Arc<EmbeddingValidator>,
     cache: Arc<EmbeddingCache>,
@@ -382,7 +365,7 @@ async fn process_batch_loop_worker(
                 info!("Worker {} received shutdown signal", worker_id);
                 if !batch.is_empty() {
                     info!("Worker {} processing final batch of {} repos", worker_id, batch.len());
-                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &cache, &retry_config).await;
+                    process_batch(&batch, &client, &embedder, &rate_limiter, &circuit_breaker, &validator, &cache, &retry_config).await;
                 }
                 break;
             }
@@ -399,7 +382,7 @@ async fn process_batch_loop_worker(
 
                 if !batch.is_empty() {
                     debug!("Worker {} processing batch of {} repos", worker_id, batch.len());
-                    process_batch(&batch, &client, &embedder, &rate_limiter, &deduplication, &circuit_breaker, &validator, &cache, &retry_config).await;
+                    process_batch(&batch, &client, &embedder, &rate_limiter, &circuit_breaker, &validator, &cache, &retry_config).await;
                     batch.clear();
                 }
             }

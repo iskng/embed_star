@@ -1,0 +1,26 @@
+#V2
+USE NS gitstars; USE DB stars; INFO FOR DB;
+DELETE repo;
+DELETE processing_lock;
+INFO FOR DB;
+SELECT full_name, embedding IS NOT NULL as has_embedding, embedding_model FROM repo;
+SELECT full_name, array::len(embedding) as embedding_length FROM repo LIMIT 3;
+SELECT count() FROM repo WHERE embedding IS NULL GROUP ALL;
+DELETE repo;
+CREATE repo:test_debug CONTENT {    full_name: "test/debug",    name: "debug",    description: "Test repo",    github_id: 999,    url: "https://github.com/test/debug",    stars: 100,    language: "Rust",    owner: {        login: "test",        avatar_url: "https://github.com/test.png"    },    is_private: false,    created_at: time::now() - 1d,    updated_at: time::now()};
+SELECT * FROM repo:test_debug;
+SELECT count() FROM repo WHERE embedding IS NULL GROUP ALL;
+SELECT count() FROM repo WHERE embedding IS NULL OR (updated_at > embedding_generated_at) GROUP ALL;
+SELECT embedding, embedding IS NULL as is_null, embedding IS NONE as is_none FROM repo:test_debug;
+DELETE repo;
+SELECT id, embedding_model, embedding_generated_at FROM repo WHERE embedding IS NOT NONE;
+SELECT count() FROM repo WHERE embedding IS NOT NONE GROUP ALL;
+SELECT count() FROM repo GROUP ALL;
+SELECT * FROM repo LIMIT 1;
+DELETE processing_lock;
+UPDATE repo:docker_docker SET embedding = [1.0, 2.0, 3.0], embedding_model = 'test', embedding_generated_at = time::now();
+SELECT id, embedding_model, embedding_generated_at FROM repo WHERE id = repo:docker_docker;
+DELETE repo; DELETE processing_lock;
+DELETE repo; DELETE processing_lock; DELETE migration;
+SELECT id, embedding_model FROM repo;
+REMOVE INDEX idx_repo_needs_embedding ON TABLE repo; DELETE repo; DELETE processing_lock; DELETE migration;

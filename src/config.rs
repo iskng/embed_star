@@ -54,6 +54,24 @@ pub struct Config {
 
     #[arg(long, env = "PARALLEL_WORKERS", default_value = "3")]
     pub parallel_workers: usize,
+
+    #[arg(long, env = "TOKEN_LIMIT", default_value = "8000")]
+    pub token_limit: usize,
+
+    #[arg(long, env = "POOL_MAX_SIZE", default_value = "10")]
+    pub pool_max_size: usize,
+
+    #[arg(long, env = "POOL_TIMEOUT_SECS", default_value = "30")]
+    pub pool_timeout_secs: u64,
+
+    #[arg(long, env = "POOL_WAIT_TIMEOUT_SECS", default_value = "10")]
+    pub pool_wait_timeout_secs: u64,
+
+    #[arg(long, env = "POOL_CREATE_TIMEOUT_SECS", default_value = "30")]
+    pub pool_create_timeout_secs: u64,
+
+    #[arg(long, env = "POOL_RECYCLE_TIMEOUT_SECS", default_value = "30")]
+    pub pool_recycle_timeout_secs: u64,
 }
 
 impl Config {
@@ -75,8 +93,20 @@ impl Config {
             anyhow::bail!("Pool size must be greater than 0");
         }
 
+        if self.pool_max_size == 0 {
+            anyhow::bail!("Pool max size must be greater than 0");
+        }
+
+        if self.pool_max_size < self.pool_size {
+            anyhow::bail!("Pool max size must be greater than or equal to pool size");
+        }
+
         if self.parallel_workers == 0 {
             anyhow::bail!("Parallel workers must be greater than 0");
+        }
+
+        if self.token_limit == 0 {
+            anyhow::bail!("Token limit must be greater than 0");
         }
 
         Ok(())
@@ -90,8 +120,13 @@ impl fmt::Display for Config {
         writeln!(f, "  Database: {}/{}", self.db_namespace, self.db_database)?;
         writeln!(f, "  Embedding Provider: {}", self.embedding_provider)?;
         writeln!(f, "  Embedding Model: {}", self.embedding_model)?;
+        writeln!(f, "  Token Limit: {} characters", self.token_limit)?;
         writeln!(f, "  Batch Size: {}", self.batch_size)?;
-        writeln!(f, "  Pool Size: {}", self.pool_size)?;
+        writeln!(f, "  Pool Size: {} (max: {})", self.pool_size, self.pool_max_size)?;
+        writeln!(f, "  Pool Timeouts: wait={}s, create={}s, recycle={}s", 
+            self.pool_wait_timeout_secs, 
+            self.pool_create_timeout_secs, 
+            self.pool_recycle_timeout_secs)?;
         Ok(())
     }
 }

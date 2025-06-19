@@ -1,9 +1,8 @@
 mod circuit_breaker;
-mod cleanup;
 mod config;
-mod deduplication;
 mod embedder;
 mod embedding_cache;
+mod embedding_validation;
 mod error;
 mod metrics;
 mod migration;

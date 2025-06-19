@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::embedding_validation::{EmbeddingValidator, together_e5_validator};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -183,6 +184,8 @@ pub struct Embedder {
     provider: Box<dyn EmbeddingProvider>,
     retry_attempts: u32,
     retry_delay_ms: u64,
+    token_limit: usize,
+    validator: Option<EmbeddingValidator>,
 }
 
 impl Embedder {
@@ -228,20 +231,65 @@ impl Embedder {
             }
         };
 
+        // Set up validator based on the model
+        let validator = match config.embedding_model.as_str() {
+            "intfloat/multilingual-e5-large-instruct" => Some(together_e5_validator()),
+            _ => None, // No validation for other models yet
+        };
+
         Ok(Self {
             provider,
             retry_attempts: config.retry_attempts,
             retry_delay_ms: config.retry_delay_ms,
+            token_limit: config.token_limit,
+            validator,
         })
     }
 
+    fn truncate_text(&self, text: &str) -> String {
+        if text.len() <= self.token_limit {
+            return text.to_string();
+        }
+
+        // Truncate to token limit and add ellipsis
+        let truncated = text.chars().take(self.token_limit - 3).collect::<String>();
+        info!(
+            "Text truncated from {} to {} characters (token limit: {})",
+            text.len(),
+            truncated.len() + 3,
+            self.token_limit
+        );
+        format!("{}...", truncated)
+    }
+
     pub async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let truncated_text = self.truncate_text(text);
         let mut attempts = 0;
 
         loop {
             attempts += 1;
-            match self.provider.generate_embedding(text).await {
+            match self.provider.generate_embedding(&truncated_text).await {
                 Ok(embedding) => {
+                    // Validate the embedding if validator is configured
+                    if let Some(validator) = &self.validator {
+                        match validator.validate(&embedding, &format!("{}:{}", self.model_name(), text.chars().take(50).collect::<String>())) {
+                            Ok(_) => {
+                                crate::metrics::record_embedding_validation(self.model_name(), true);
+                            }
+                            Err(e) => {
+                                crate::metrics::record_embedding_validation(self.model_name(), false);
+                                error!("Embedding validation failed: {}", e);
+                                // Convert to retryable error so we can try again
+                                if attempts < self.retry_attempts {
+                                    warn!("Retrying due to validation failure...");
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(self.retry_delay_ms)).await;
+                                    continue;
+                                }
+                                return Err(anyhow::anyhow!("Embedding validation failed: {}", e));
+                            }
+                        }
+                    }
+                    
                     debug!(
                         "Generated embedding with {} dimensions",
                         embedding.len()
@@ -269,5 +317,75 @@ impl Embedder {
 
     pub fn model_name(&self) -> &str {
         self.provider.model_name()
+    }
+
+    pub fn set_validator(&mut self, validator: Option<EmbeddingValidator>) {
+        self.validator = validator;
+    }
+
+    pub fn enable_validation(&mut self) {
+        if self.validator.is_none() {
+            // Use default validator
+            self.validator = Some(EmbeddingValidator::default());
+        }
+    }
+
+    pub fn disable_validation(&mut self) {
+        self.validator = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_text_truncation() {
+        // Create a mock config
+        let config = Config {
+            db_url: "ws://localhost:8000".to_string(),
+            db_user: "root".to_string(),
+            db_pass: "root".to_string(),
+            db_namespace: "test".to_string(),
+            db_database: "test".to_string(),
+            embedding_provider: "ollama".to_string(),
+            ollama_url: "http://localhost:11434".to_string(),
+            openai_api_key: None,
+            together_api_key: None,
+            embedding_model: "test-model".to_string(),
+            batch_size: 10,
+            batch_delay_ms: 100,
+            pool_size: 10,
+            retry_attempts: 3,
+            retry_delay_ms: 1000,
+            monitoring_port: None,
+            parallel_workers: 1,
+            token_limit: 100, // Small limit for testing
+            pool_max_size: 10,
+            pool_timeout_secs: 30,
+            pool_wait_timeout_secs: 10,
+            pool_create_timeout_secs: 30,
+            pool_recycle_timeout_secs: 30,
+        };
+
+        // Create embedder (will fail to connect but that's OK for this test)
+        let embedder = Embedder::new(Arc::new(config)).unwrap();
+
+        // Test short text (should not be truncated)
+        let short_text = "This is a short text";
+        let result = embedder.truncate_text(short_text);
+        assert_eq!(result, short_text);
+
+        // Test long text (should be truncated)
+        let long_text = "a".repeat(200); // 200 characters
+        let result = embedder.truncate_text(&long_text);
+        assert_eq!(result.len(), 100); // 97 chars + "..."
+        assert!(result.ends_with("..."));
+        assert_eq!(&result[..97], &long_text[..97]);
+
+        // Test exact limit
+        let exact_text = "b".repeat(100);
+        let result = embedder.truncate_text(&exact_text);
+        assert_eq!(result, exact_text); // Should not be truncated
     }
 }

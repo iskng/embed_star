@@ -2,7 +2,7 @@ use embed_star::config::Config;
 use embed_star::models::{ Repo, RepoOwner };
 use embed_star::error::EmbedError;
 use chrono::Utc;
-use surrealdb::sql::Thing;
+use surrealdb::RecordId;
 
 #[test]
 fn test_repo_needs_embedding() {
@@ -10,7 +10,7 @@ fn test_repo_needs_embedding() {
     let earlier = now - chrono::Duration::hours(1);
 
     let repo = Repo {
-        id: Thing::from(("repo", "test/repo")),
+        id: RecordId::from(("repo", "test/repo")),
         github_id: 123,
         name: "repo".to_string(),
         full_name: "test/repo".to_string(),
@@ -26,7 +26,6 @@ fn test_repo_needs_embedding() {
         created_at: earlier,
         updated_at: now,
         embedding: None,
-        embedding_model: None,
         embedding_generated_at: None,
     };
 
@@ -34,7 +33,6 @@ fn test_repo_needs_embedding() {
 
     let repo_with_embedding = Repo {
         embedding: Some(vec![0.1, 0.2, 0.3]),
-        embedding_model: Some("test-model".to_string()),
         embedding_generated_at: Some(earlier),
         ..repo.clone()
     };
@@ -55,7 +53,7 @@ fn test_repo_needs_embedding() {
 #[test]
 fn test_prepare_text_for_embedding() {
     let repo = Repo {
-        id: Thing::from(("repo", "rust-lang/rust")),
+        id: RecordId::from(("repo", "rust-lang/rust")),
         github_id: 123,
         name: "rust".to_string(),
         full_name: "rust-lang/rust".to_string(),
@@ -71,7 +69,6 @@ fn test_prepare_text_for_embedding() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         embedding: None,
-        embedding_model: None,
         embedding_generated_at: None,
     };
 
@@ -112,6 +109,12 @@ fn test_config_validation() {
         batch_delay_ms: 100,
         monitoring_port: Some(9090),
         parallel_workers: 3,
+        token_limit: 8000,
+        pool_max_size: 10,
+        pool_timeout_secs: 30,
+        pool_wait_timeout_secs: 10,
+        pool_create_timeout_secs: 30,
+        pool_recycle_timeout_secs: 30,
     };
 
     // Should fail - OpenAI provider without API key

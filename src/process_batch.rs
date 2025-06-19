@@ -1,6 +1,5 @@
 use crate::{
     circuit_breaker::CircuitBreakerManager,
-    deduplication::{DeduplicationManager, LockGuard},
     embedder::Embedder,
     embedding_cache::EmbeddingCache,
     error::EmbedError,
@@ -14,7 +13,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::time::Instant;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub async fn process_batch(
@@ -22,81 +21,68 @@ pub async fn process_batch(
     client: &Arc<SurrealClient>,
     embedder: &Arc<Embedder>,
     rate_limiter: &Arc<RateLimiterManager>,
-    deduplication: &Arc<DeduplicationManager>,
     circuit_breaker: &Arc<CircuitBreakerManager>,
     validator: &Arc<EmbeddingValidator>,
     cache: &Arc<EmbeddingCache>,
     retry_config: &RetryConfig,
 ) {
     let batch_id = Uuid::new_v4();
+    let batch_size = batch.len();
+    
+    // Create a cleaner log with just the essential info
     info!(
         batch_id = %batch_id,
-        batch_size = batch.len(),
+        batch_size = batch_size,
         "Processing batch"
+    );
+
+    // Log the repos being processed in this batch (at debug level)
+    debug!(
+        batch_id = %batch_id,
+        repos = ?batch.iter().map(|r| &r.full_name).collect::<Vec<_>>(),
+        "Batch contains repos"
     );
 
     // Collect successful updates for batch processing
     let mut pending_updates = Vec::new();
-    let mut lock_guards = Vec::new();
 
-    for repo in batch {
-        let span = tracing::info_span!(
+    for (idx, repo) in batch.iter().enumerate() {
+        // Process each repo with a clean span
+        let repo_span = tracing::debug_span!(
             "process_repo",
-            repo_id = %repo.id,
             repo_name = %repo.full_name,
-            batch_id = %batch_id
+            repo_index = idx,
+            batch_progress = %format!("{}/{}", idx + 1, batch_size)
         );
-        let _enter = span.enter();
-
-        // Try to acquire lock for this repository
-        match deduplication.try_acquire_lock(&repo.id).await {
-            Ok(true) => {
-                // Lock acquired, proceed with processing
-                debug!("Acquired lock for repo {}", repo.full_name);
-            }
-            Ok(false) => {
-                // Another instance is processing this repo
-                debug!("Repo {} is being processed by another instance", repo.full_name);
-                continue;
-            }
-            Err(e) => {
-                error!("Failed to check lock for repo {}: {}", repo.full_name, e);
-                continue;
-            }
-        }
-
-        // Create lock guard for automatic cleanup
-        let lock_guard = LockGuard::new(deduplication, repo.id.clone());
+        
+        let _enter = repo_span.enter();
+        
+        debug!("Processing repository");
 
         let text = repo.prepare_text_for_embedding();
         let provider = embedder.model_name();
         let cache_key = EmbeddingCache::cache_key(&repo.full_name, provider);
         
         // Check cache first
-        if let Some((cached_embedding, cached_model)) = cache.get(&cache_key) {
-            info!("Using cached embedding for {}", repo.full_name);
+        if let Some((cached_embedding, _cached_model)) = cache.get(&cache_key) {
+            info!("Using cached embedding");
             
             // Add to pending updates with cached embedding
             pending_updates.push(EmbeddingUpdate {
                 repo_id: repo.id.clone(),
                 embedding: cached_embedding,
-                model: cached_model,
             });
-            
-            // Store lock guard for later release
-            lock_guards.push((repo.id.clone(), lock_guard));
             continue;
         }
-        
-        // Check rate limit
-        if let Err(e) = rate_limiter.wait_for_permit(provider).await {
-            error!("Rate limit error: {}", e);
-            if let Err(e) = lock_guard.release("failed").await {
-                error!("Failed to release lock: {}", e);
-            }
+
+        // Wait for rate limit permit
+        if let Err(e) = rate_limiter.wait_for_permit(&provider).await {
+            error!(error = %e, "Rate limit error, skipping repo");
+            metrics::record_rate_limit(&provider);
             continue;
         }
-        
+
+        // Generate embedding with circuit breaker
         let start = Instant::now();
         
         let embedding_result = with_circuit_breaker!(
@@ -133,73 +119,53 @@ pub async fn process_batch(
                         pending_updates.push(EmbeddingUpdate {
                             repo_id: repo.id.clone(),
                             embedding,
-                            model: embedder.model_name().to_string(),
                         });
                         
-                        // Store lock guard for later release
-                        lock_guards.push((repo.id.clone(), lock_guard));
+                        info!(
+                            duration_ms = (duration * 1000.0) as u64,
+                            "Generated embedding successfully"
+                        );
                     }
                     Err(e) => {
-                        error!("Embedding validation failed for {}: {}", repo.full_name, e);
-                        metrics::record_embedding_error(provider, "validation_failed");
-                        // Release lock with failure status
-                        if let Err(e) = lock_guard.release("failed").await {
-                            error!("Failed to release lock: {}", e);
-                        }
+                        error!(error = %e, "Embedding validation failed");
+                        metrics::record_provider_request(provider, false);
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to generate embedding: {}", e);
+                error!(error = %e, "Failed to generate embedding");
                 metrics::record_embedding_error(provider, e.error_code());
                 metrics::record_provider_request(provider, false);
-                // Release lock with failure status
-                if let Err(e) = lock_guard.release("failed").await {
-                    error!("Failed to release lock: {}", e);
-                }
             }
         }
     }
-    
-    // Batch update all successful embeddings
+
+    // Batch update embeddings if any were generated
     if !pending_updates.is_empty() {
-        info!(
-            "Batch updating {} embeddings",
-            pending_updates.len()
-        );
-        
-        match with_retry(
-            "batch_update_embeddings",
-            retry_config,
-            || async {
-                client.batch_update_embeddings(pending_updates.clone()).await
-            },
-        ).await {
+        let update_count = pending_updates.len();
+        match client.batch_update_embeddings(pending_updates).await {
             Ok(result) => {
                 info!(
-                    "Batch update completed: {} successful, {} failed in {:?}",
-                    result.successful,
-                    result.failed,
-                    result.duration
+                    batch_id = %batch_id,
+                    successful = result.successful,
+                    failed = result.failed,
+                    duration_ms = result.duration.as_millis(),
+                    "Batch update completed"
                 );
-                
-                // Release locks for successful updates
-                for (repo_id, guard) in lock_guards {
-                    if let Err(e) = guard.release("completed").await {
-                        error!("Failed to release lock for {:?}: {}", repo_id, e);
-                    }
-                }
             }
             Err(e) => {
-                error!("Batch update failed: {}", e);
-                
-                // Release locks with failure status
-                for (repo_id, guard) in lock_guards {
-                    if let Err(e) = guard.release("failed").await {
-                        error!("Failed to release lock for {:?}: {}", repo_id, e);
-                    }
-                }
+                error!(
+                    batch_id = %batch_id,
+                    updates_lost = update_count,
+                    error = %e,
+                    "Failed to batch update embeddings"
+                );
             }
         }
+    } else {
+        warn!(
+            batch_id = %batch_id,
+            "No embeddings were generated in this batch"
+        );
     }
 }

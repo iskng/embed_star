@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use surrealdb::sql::Thing;
+use surrealdb::RecordId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoOwner {
@@ -10,7 +10,7 @@ pub struct RepoOwner {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Repo {
-    pub id: Thing,
+    pub id: RecordId,
     pub github_id: i64,
     pub name: String,
     pub full_name: String,
@@ -23,7 +23,6 @@ pub struct Repo {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub embedding: Option<Vec<f32>>,
-    pub embedding_model: Option<String>,
     pub embedding_generated_at: Option<DateTime<Utc>>,
 }
 

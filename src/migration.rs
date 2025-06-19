@@ -15,12 +15,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_embedding_fields",
         up: r#"
             DEFINE FIELD IF NOT EXISTS embedding ON TABLE repo TYPE option<array<float>>;
-            DEFINE FIELD IF NOT EXISTS embedding_model ON TABLE repo TYPE option<string>;
             DEFINE FIELD IF NOT EXISTS embedding_generated_at ON TABLE repo TYPE option<datetime>;
         "#,
         down: r#"
             REMOVE FIELD embedding ON TABLE repo;
-            REMOVE FIELD embedding_model ON TABLE repo;
             REMOVE FIELD embedding_generated_at ON TABLE repo;
         "#,
     },
@@ -29,17 +27,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_embedding_indexes",
         up: r#"
             DEFINE INDEX IF NOT EXISTS idx_repo_embedding_generated_at ON TABLE repo COLUMNS embedding_generated_at;
-            DEFINE INDEX IF NOT EXISTS idx_repo_needs_embedding ON TABLE repo COLUMNS embedding, updated_at;
         "#,
         down: r#"
             REMOVE INDEX idx_repo_embedding_generated_at ON TABLE repo;
-            REMOVE INDEX idx_repo_needs_embedding ON TABLE repo;
         "#,
     },
 ];
 
-pub async fn run_migrations(db: &Pool) -> Result<()> {
+pub async fn run_migrations(pool: &Pool) -> Result<()> {
     info!("Running database migrations...");
+    
+    // Get a connection from the pool
+    let db = pool.get().await
+        .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))?;
     
     // Create migration tracking table
     db.query(r#"
@@ -52,10 +52,10 @@ pub async fn run_migrations(db: &Pool) -> Result<()> {
     .await?;
     
     // Get current version
-    let current_version: Option<u32> = db
+    let mut response = db
         .query("SELECT VALUE version FROM migration ORDER BY version DESC LIMIT 1")
-        .await?
-        .take(0)?;
+        .await?;
+    let current_version: Option<u32> = response.take(0)?;
     
     let current_version = current_version.unwrap_or(0);
     info!("Current migration version: {}", current_version);
@@ -88,7 +88,7 @@ pub async fn run_migrations(db: &Pool) -> Result<()> {
                     }"
                 )
                 .bind(("version", migration.version))
-                .bind(("name", migration.name))
+                .bind(("name", migration.name.to_string()))
                 .await?;
                 
                 db.query("COMMIT TRANSACTION").await?;
@@ -109,11 +109,15 @@ pub async fn run_migrations(db: &Pool) -> Result<()> {
     Ok(())
 }
 
-pub async fn rollback_migration(db: &Pool, target_version: u32) -> Result<()> {
-    let current_version: Option<u32> = db
+pub async fn rollback_migration(pool: &Pool, target_version: u32) -> Result<()> {
+    // Get a connection from the pool
+    let db = pool.get().await
+        .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))?;
+    
+    let mut response = db
         .query("SELECT VALUE version FROM migration ORDER BY version DESC LIMIT 1")
-        .await?
-        .take(0)?;
+        .await?;
+    let current_version: Option<u32> = response.take(0)?;
     
     let current_version = current_version.unwrap_or(0);
     

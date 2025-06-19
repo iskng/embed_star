@@ -8,7 +8,8 @@ The `embed_star` crate is now production-ready with comprehensive features for g
 
 ### Core Functionality ✅
 - **Multi-provider Embedding Support**: Ollama (local), OpenAI, Together AI
-- **SurrealDB Integration**: Live queries, batch operations, connection pooling
+- **SurrealDB Integration**: Live queries, batch operations, connection pooling with Any engine
+- **Dynamic Connection Types**: Supports ws://, wss://, http://, https://, memory://, rocksdb:// etc.
 - **Batch Processing**: Configurable batch sizes with parallel workers
 - **Graceful Shutdown**: Proper cleanup and task completion
 
@@ -19,9 +20,11 @@ The `embed_star` crate is now production-ready with comprehensive features for g
 
 ### Performance Optimizations ✅
 1. **Batch Database Operations**: Bulk updates reduce database round-trips
-2. **Connection Pool Monitoring**: Metrics for pool health and performance
+2. **Proper Connection Pooling**: Deadpool-based connection pool with health checks and recycling
 3. **Embedding Cache**: LRU cache with TTL for frequently accessed embeddings
 4. **Parallel Processing**: Multiple workers process batches concurrently
+5. **Text Truncation**: Automatic truncation when text exceeds TOKEN_LIMIT to prevent embedding failures
+6. **Pool Monitoring**: Real-time metrics for connection pool health and performance
 
 ### Production Infrastructure ✅
 - **Prometheus Metrics**: Comprehensive monitoring of all operations
@@ -109,11 +112,12 @@ kubectl apply -f deployments/kubernetes/
 ## Configuration
 
 Key environment variables:
-- `DB_URL`: SurrealDB WebSocket URL
+- `DB_URL`: SurrealDB URL (supports ws://, wss://, http://, https://)
 - `EMBEDDING_PROVIDER`: ollama/openai/together
 - `BATCH_SIZE`: Number of repos per batch (default: 10)
 - `PARALLEL_WORKERS`: Concurrent processors (default: 3)
 - `MONITORING_PORT`: Prometheus metrics port (default: 9090)
+- `TOKEN_LIMIT`: Maximum text length before truncation (default: 8000 characters)
 
 ## Monitoring
 

@@ -36,6 +36,15 @@ RUST_LOG=debug,embed_star=trace cargo run
 
 # Run with specific embedding provider
 cargo run -- --embedding-provider together --embedding-model togethercomputer/m2-bert-80M-8k-retrieval
+
+# Run validation test example
+cargo run --example test_validation
+
+# Run validation edge cases example
+cargo run --example validation_edge_cases
+
+# Run Together API integration tests (requires TOGETHER_API_KEY)
+cargo test test_together_api -- --ignored
 ```
 
 ### Docker Operations
@@ -71,6 +80,7 @@ The service automatically runs migrations on startup. Manual migration commands 
    - Trait-based design (`EmbeddingProvider`) for multiple providers
    - Implementations for Ollama (local), OpenAI, and Together AI
    - Each provider handles its own API specifics and error cases
+   - Automatic text truncation when exceeding TOKEN_LIMIT to prevent token limit errors
 
 ### Production Features
 
@@ -92,18 +102,31 @@ The service automatically runs migrations on startup. Manual migration commands 
 4. **Metrics (metrics.rs, server.rs)**:
    - Prometheus metrics exposed on port 9090
    - Health check endpoints for Kubernetes
-   - Key metrics: embeddings_total, errors, duration, pending repos
+   - Key metrics: embeddings_total, errors, duration, pending repos, validation results
+   - Embedding validation metrics track pass/fail rates per model
 
 5. **Graceful Shutdown (shutdown.rs)**:
    - Handles SIGINT/SIGTERM signals
    - Waits for all tasks to complete
    - Configurable shutdown timeout
 
+6. **Embedding Validation (embedding_validation.rs)**:
+   - Validates embedding quality before storing in database
+   - Checks for: correct dimensions, magnitude range, NaN/Inf values, variance
+   - Model-specific validators (e.g., `together_e5_validator()` for multilingual-e5-large)
+   - Automatic retry on validation failure
+   - Batch validation support with detailed statistics
+   - Metrics integration to track validation success rates
+
 ### Key Design Decisions
 
 1. **Polling vs Live Queries**: Due to SurrealDB v1.5 API changes, the service uses polling with deduplication instead of live queries. The polling interval is 5 seconds.
 
-2. **Connection Pooling**: Simplified to use `Arc<Surreal<Client>>` instead of deadpool due to version compatibility issues.
+2. **Connection Pooling**: Proper connection pooling with deadpool providing:
+   - Multiple concurrent connections (configurable via POOL_MAX_SIZE)
+   - Automatic connection health checks and recycling
+   - Connection reuse for better performance
+   - Pool metrics and monitoring
 
 3. **Batch Processing**: Repos are processed in configurable batches (default 10) with delays between batches to prevent overload.
 
@@ -112,12 +135,16 @@ The service automatically runs migrations on startup. Manual migration commands 
 ## Environment Configuration
 
 Critical environment variables:
-- `DB_URL`: SurrealDB WebSocket URL (default: ws://localhost:8000)
+- `DB_URL`: SurrealDB URL - supports ws://, wss://, http://, https:// (default: ws://localhost:8000)
 - `EMBEDDING_PROVIDER`: Choice of ollama, openai, or together
 - `OPENAI_API_KEY` / `TOGETHER_API_KEY`: Required for cloud providers
 - `EMBEDDING_MODEL`: Model name specific to chosen provider
 - `BATCH_SIZE`: Number of repos to process concurrently
 - `MONITORING_PORT`: Port for metrics/health endpoints (default: 9090)
+- `TOKEN_LIMIT`: Maximum text length in characters before truncation (default: 8000)
+- `POOL_MAX_SIZE`: Maximum database connections in pool (default: 10)
+- `POOL_WAIT_TIMEOUT_SECS`: Timeout waiting for connection (default: 10)
+- `POOL_CREATE_TIMEOUT_SECS`: Timeout creating new connection (default: 30)
 
 ## Database Schema
 
@@ -125,7 +152,6 @@ The service expects a `repo` table with these fields and adds embedding fields:
 ```sql
 -- Added by migrations
 DEFINE FIELD embedding ON TABLE repo TYPE option<array<float>>;
-DEFINE FIELD embedding_model ON TABLE repo TYPE option<string>;
 DEFINE FIELD embedding_generated_at ON TABLE repo TYPE option<datetime>;
 ```
 
@@ -160,3 +186,7 @@ Metrics are designed for Grafana dashboards and alerting.
 2. **Rate Limits**: If hitting rate limits, reduce BATCH_SIZE or increase BATCH_DELAY_MS
 3. **Memory Usage**: Large batches can consume significant memory; tune BATCH_SIZE accordingly
 4. **Embedding Provider Errors**: Check API keys and network connectivity to providers
+5. **Token Limit Errors**: Text is automatically truncated to TOKEN_LIMIT (default 8000 chars). Adjust if needed for your model
+
+## Key Memory Notes
+- Never use Thing in SurrealDB, always use RecordId instead

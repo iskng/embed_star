@@ -1,9 +1,8 @@
 pub mod circuit_breaker;
-pub mod cleanup;
 pub mod config;
-pub mod deduplication;
 pub mod embedder;
 pub mod embedding_cache;
+pub mod embedding_validation;
 pub mod error;
 pub mod metrics;
 pub mod migration;

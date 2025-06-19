@@ -8,13 +8,12 @@ use axum::{
 use prometheus::{Encoder, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use crate::{deduplication::DeduplicationManager, pool::Pool};
+use crate::pool::{Pool, PoolExt};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: Pool,
     pub registry: Arc<Registry>,
-    pub deduplication: Option<Arc<DeduplicationManager>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -23,13 +22,21 @@ pub struct HealthResponse {
     pub version: String,
     pub database: DatabaseHealth,
     pub embedding_providers: Vec<ProviderHealth>,
-    pub processing_locks: Option<ProcessingLocksHealth>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct DatabaseHealth {
     pub connected: bool,
     pub latency_ms: Option<u64>,
+    pub pool_stats: Option<PoolStats>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PoolStats {
+    pub size: usize,
+    pub available: usize,
+    pub waiting: usize,
+    pub max_size: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,43 +46,39 @@ pub struct ProviderHealth {
     pub latency_ms: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct ProcessingLocksHealth {
-    pub active_locks: usize,
-    pub instance_id: String,
-}
 
 pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthResponse>, StatusCode> {
     // Check database health
     let db_start = std::time::Instant::now();
-    let db_connected = match state.db_pool.health().await {
-        Ok(_) => true,
+    let db_connected = match state.db_pool.get().await {
+        Ok(conn) => {
+            // Perform a simple health check query
+            match conn.query("SELECT 1 as health_check").await {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
         Err(_) => false,
     };
     let db_latency = db_start.elapsed().as_millis() as u64;
-    
-    // Check processing locks if available
-    let processing_locks = if let Some(dedup) = &state.deduplication {
-        match dedup.get_active_locks_count().await {
-            Ok(count) => Some(ProcessingLocksHealth {
-                active_locks: count,
-                instance_id: "embed_star".to_string(), // We could expose instance ID from dedup manager
-            }),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
 
+    // Get pool statistics
+    let pool_stats = state.db_pool.stats();
+    
     let health = HealthResponse {
         status: if db_connected { "healthy".to_string() } else { "unhealthy".to_string() },
         version: env!("CARGO_PKG_VERSION").to_string(),
         database: DatabaseHealth {
             connected: db_connected,
             latency_ms: Some(db_latency),
+            pool_stats: Some(PoolStats {
+                size: pool_stats.size,
+                available: pool_stats.available,
+                waiting: pool_stats.waiting,
+                max_size: pool_stats.max_size,
+            }),
         },
         embedding_providers: vec![], // TODO: Check provider health
-        processing_locks,
     };
     
     if db_connected {

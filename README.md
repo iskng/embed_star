@@ -24,7 +24,6 @@ Before running, add the embedding fields to your repo table:
 
 ```sql
 DEFINE FIELD embedding ON TABLE repo TYPE option<array<float>>;
-DEFINE FIELD embedding_model ON TABLE repo TYPE option<string>;
 DEFINE FIELD embedding_generated_at ON TABLE repo TYPE option<datetime>;
 ```
 

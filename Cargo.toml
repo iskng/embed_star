@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Core dependencies matching main project
 tokio = { version = "1.35", features = ["full"] }
-surrealdb = { version = "1.5", features = ["protocol-ws"] }
+surrealdb = { version = "2.3", features = ["protocol-ws", "protocol-http"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -48,6 +48,9 @@ backoff = { version = "0.4", features = ["tokio"] }
 
 # High priority robustness features
 parking_lot = "0.12"
+
+# Connection pooling
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 
 [dev-dependencies]
 mockall = "0.12"

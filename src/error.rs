@@ -20,6 +20,9 @@ pub enum EmbedError {
     #[error("Invalid embedding dimension: expected {expected}, got {actual}")]
     InvalidDimension { expected: usize, actual: usize },
     
+    #[error("Invalid embedding: {0}")]
+    InvalidEmbedding(String),
+    
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
     
@@ -51,6 +54,7 @@ impl EmbedError {
             EmbedError::Http(_) => "HTTP_ERROR",
             EmbedError::RateLimitExceeded { .. } => "RATE_LIMIT",
             EmbedError::InvalidDimension { .. } => "INVALID_DIMENSION",
+            EmbedError::InvalidEmbedding(_) => "INVALID_EMBEDDING",
             EmbedError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
             EmbedError::ValidationError(_) => "VALIDATION_ERROR",
             EmbedError::Internal(_) => "INTERNAL_ERROR",

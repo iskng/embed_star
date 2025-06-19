@@ -1,6 +1,6 @@
-use crate::{metrics, pool::Pool};
+use crate::{metrics, pool::{Pool, PoolExt}};
 use tokio::time::{interval, Duration};
-use tracing::error;
+use tracing::{debug, error};
 
 /// Monitor connection pool statistics
 pub async fn monitor_pool_metrics(
@@ -22,36 +22,40 @@ pub async fn monitor_pool_metrics(
 }
 
 async fn report_pool_metrics(pool: &Pool) {
-    // For SurrealDB, we track basic connection health
-    match pool.health().await {
-        Ok(_) => {
-            metrics::update_active_connections("surrealdb", 1);
+    // Get pool statistics
+    let stats = pool.stats();
+    
+    debug!(
+        "Pool stats - size: {}, available: {}, waiting: {}, max: {}",
+        stats.size, stats.available, stats.waiting, stats.max_size
+    );
+    
+    // Update metrics
+    metrics::update_active_connections("surrealdb", stats.size as i64);
+    metrics::set_pool_connections_active(stats.size as i64 - stats.available as i64);
+    metrics::set_pool_connections_idle(stats.available as i64);
+    metrics::set_pool_connections_waiting(stats.waiting as i64);
+    
+    // Perform a health check on the pool
+    match pool.get().await {
+        Ok(conn) => {
+            // Connection acquired successfully, perform a simple health check
+            match conn.query("RETURN 1").await {
+                Ok(_) => {
+                    debug!("Pool health check passed");
+                }
+                Err(e) => {
+                    error!("Pool health check failed: {}", e);
+                    metrics::increment_pool_health_check_failures();
+                }
+            }
         }
         Err(e) => {
-            error!("Database connection unhealthy: {}", e);
-            metrics::update_active_connections("surrealdb", 0);
+            error!("Failed to acquire connection from pool: {}", e);
+            metrics::increment_pool_connection_errors();
         }
     }
 }
 
-/// Connection pool statistics
-#[derive(Debug, Clone)]
-pub struct PoolStats {
-    pub total_connections: u32,
-    pub active_connections: u32,
-    pub idle_connections: u32,
-    pub wait_count: u64,
-    pub wait_duration: Duration,
-}
-
-impl Default for PoolStats {
-    fn default() -> Self {
-        Self {
-            total_connections: 1,
-            active_connections: 0,
-            idle_connections: 1,
-            wait_count: 0,
-            wait_duration: Duration::from_secs(0),
-        }
-    }
-}
+/// Connection pool statistics (re-exported from pool module)
+pub use crate::pool::PoolStats;
