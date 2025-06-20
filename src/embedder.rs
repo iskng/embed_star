@@ -182,6 +182,7 @@ impl EmbeddingProvider for TogetherAIEmbedder {
 
 pub struct Embedder {
     provider: Box<dyn EmbeddingProvider>,
+    provider_name: String,
     retry_attempts: u32,
     retry_delay_ms: u64,
     token_limit: usize,
@@ -239,6 +240,7 @@ impl Embedder {
 
         Ok(Self {
             provider,
+            provider_name: config.embedding_provider.clone(),
             retry_attempts: config.retry_attempts,
             retry_delay_ms: config.retry_delay_ms,
             token_limit: config.token_limit,
@@ -317,6 +319,10 @@ impl Embedder {
 
     pub fn model_name(&self) -> &str {
         self.provider.model_name()
+    }
+    
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 
     pub fn set_validator(&mut self, validator: Option<EmbeddingValidator>) {

@@ -8,12 +8,17 @@ use axum::{
 use prometheus::{Encoder, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use crate::pool::{Pool, PoolExt};
+use tokio::time::{timeout, Duration};
+use crate::{
+    embedder::Embedder,
+    pool::{Pool, PoolExt},
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: Pool,
     pub registry: Arc<Registry>,
+    pub embedder: Arc<Embedder>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,7 +83,7 @@ pub async fn health_check(State(state): State<AppState>) -> Result<Json<HealthRe
                 max_size: pool_stats.max_size,
             }),
         },
-        embedding_providers: vec![], // TODO: Check provider health
+        embedding_providers: check_provider_health(&state.embedder).await,
     };
     
     if db_connected {
@@ -109,6 +114,35 @@ pub async fn liveness_check() -> impl IntoResponse {
         "status": "alive",
         "timestamp": chrono::Utc::now()
     }))
+}
+
+async fn check_provider_health(embedder: &Arc<Embedder>) -> Vec<ProviderHealth> {
+    let provider_name = embedder.provider_name();
+    let model_name = embedder.model_name();
+    
+    // Test the provider by trying to generate an embedding for a short test text
+    let test_text = "health check";
+    let start = std::time::Instant::now();
+    
+    let health_check_result = timeout(
+        Duration::from_secs(5),
+        embedder.generate_embedding(test_text)
+    ).await;
+    
+    let (available, latency_ms) = match health_check_result {
+        Ok(Ok(_)) => {
+            let latency = start.elapsed().as_millis() as u64;
+            (true, Some(latency))
+        }
+        Ok(Err(_)) => (false, None),
+        Err(_) => (false, None), // Timeout
+    };
+    
+    vec![ProviderHealth {
+        name: format!("{} ({})", provider_name, model_name),
+        available,
+        latency_ms,
+    }]
 }
 
 pub fn create_monitoring_router(state: AppState) -> Router {

@@ -103,9 +103,20 @@ impl SurrealClient {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             let mut processed_ids = std::collections::HashSet::new();
+            let mut clear_counter = 0;
+            const MAX_PROCESSED_IDS: usize = 10000;
+            const CLEAR_INTERVAL: u32 = 100; // Clear every 100 iterations (500 seconds)
 
             loop {
                 interval.tick().await;
+                clear_counter += 1;
+
+                // Periodically clear the processed IDs to prevent unbounded growth
+                if clear_counter >= CLEAR_INTERVAL || processed_ids.len() > MAX_PROCESSED_IDS {
+                    debug!("Clearing processed IDs cache (size was: {})", processed_ids.len());
+                    processed_ids.clear();
+                    clear_counter = 0;
+                }
 
                 match client.get_repos_needing_embeddings(50).await {
                     Ok(repos) => {
@@ -222,9 +233,64 @@ impl SurrealClient {
             return Ok(BatchUpdateResult::default());
         }
 
-        // For now, just use individual updates to ensure it works
-        // TODO: Optimize with proper batch updates once we figure out the syntax
-        self.fallback_individual_updates(updates).await
+        let start = Instant::now();
+        let total = updates.len();
+
+        // Try to use proper batch update with transaction
+        match self.batch_update_with_transaction(updates.clone()).await {
+            Ok(successful) => {
+                Ok(BatchUpdateResult {
+                    total,
+                    successful,
+                    failed: total - successful,
+                    duration: start.elapsed(),
+                })
+            }
+            Err(e) => {
+                warn!("Batch update failed, falling back to individual updates: {}", e);
+                // Fallback to individual updates if batch fails
+                self.fallback_individual_updates(updates).await
+            }
+        }
+    }
+
+    /// Perform batch updates using a transaction
+    async fn batch_update_with_transaction(
+        &self,
+        updates: Vec<EmbeddingUpdate>
+    ) -> Result<usize> {
+        let conn = self.pool.get().await
+            .map_err(|e| EmbedError::Database(
+                surrealdb::Error::Api(surrealdb::error::Api::InternalError(e.to_string()))
+            ))?;
+
+        // Build a single query with all updates
+        let mut query = String::from("BEGIN TRANSACTION;\n");
+        
+        for (idx, _) in updates.iter().enumerate() {
+            query.push_str(&format!(
+                "UPDATE $repo_{} SET embedding = $embedding_{}, embedding_generated_at = time::now();\n",
+                idx, idx
+            ));
+        }
+        
+        query.push_str("COMMIT TRANSACTION;");
+
+        // Create query and bind parameters
+        let mut bound_query = conn.query(query);
+        for (idx, update) in updates.iter().enumerate() {
+            bound_query = bound_query
+                .bind((format!("repo_{}", idx), update.repo_id.clone()))
+                .bind((format!("embedding_{}", idx), update.embedding.clone()));
+        }
+
+        // Execute the transaction
+        let _response = bound_query.await?;
+        
+        // Count successful updates
+        let successful = updates.len(); // If transaction succeeds, all updates succeeded
+        
+        Ok(successful)
     }
 
     /// Fallback to individual updates if batch update fails

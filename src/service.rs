@@ -128,6 +128,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
     let app_state = AppState {
         db_pool: pool.clone(),
         registry: registry.clone(),
+        embedder: embedder.clone(),
     };
     
     let monitoring_handle: JoinHandle<()> = tokio::spawn({

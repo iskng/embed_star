@@ -1,0 +1,15 @@
+# Development overrides for docker-compose
+# This file is automatically loaded by docker-compose
+version: '3.8'
+
+services:
+  embed_star:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - RUST_LOG=debug,embed_star=trace
+      - RUST_BACKTRACE=1
+    volumes:
+      - ./target:/app/target
+      - ./.env:/data/.env:ro
