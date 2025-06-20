@@ -73,7 +73,7 @@ pub async fn run_with_config(config: Config) -> anyhow::Result<()> {
                 },
             );
         }
-        "together" | "togetherai" => {
+        "together" => {
             rate_limiter.configure_provider("together", 1000).await?;
             circuit_breaker.configure_service(
                 "together",

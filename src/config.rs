@@ -19,6 +19,7 @@ pub struct Config {
     #[arg(long, env = "DB_DATABASE", default_value = "stars")]
     pub db_database: String,
 
+    /// Embedding provider: "ollama", "openai", or "together"
     #[arg(long, env = "EMBEDDING_PROVIDER", default_value = "ollama")]
     pub embedding_provider: String,
 
@@ -80,8 +81,7 @@ impl Config {
             anyhow::bail!("OpenAI API key is required when using OpenAI as embedding provider");
         }
 
-        if (self.embedding_provider == "together" || self.embedding_provider == "togetherai") 
-            && self.together_api_key.is_none() {
+        if self.embedding_provider == "together" && self.together_api_key.is_none() {
             anyhow::bail!("Together AI API key is required when using Together AI as embedding provider");
         }
 

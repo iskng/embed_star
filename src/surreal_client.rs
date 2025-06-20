@@ -3,6 +3,8 @@ use serde_json;
 use surrealdb::RecordId;
 use tracing::{ debug, error, info, warn };
 use std::time::Instant;
+#[cfg(test)]
+use deadpool::managed::Object;
 
 #[derive(Clone)]
 pub struct SurrealClient {
@@ -328,6 +330,13 @@ impl SurrealClient {
     pub fn get_pool_stats(&self) -> crate::pool::PoolStats {
         self.pool.stats()
     }
+    
+    #[cfg(test)]
+    pub async fn get_connection(&self) -> Result<Object<crate::pool::SurrealDBManager>> {
+        self.pool.get().await.map_err(|e| EmbedError::Database(
+            surrealdb::Error::Api(surrealdb::error::Api::InternalError(e.to_string()))
+        ))
+    }
 }
 
 /// Represents a single embedding update
@@ -344,4 +353,210 @@ pub struct BatchUpdateResult {
     pub successful: usize,
     pub failed: usize,
     pub duration: std::time::Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, models::Repo};
+    use chrono::Utc;
+    use std::sync::Arc;
+
+    async fn setup_test_client() -> (SurrealClient, Pool) {
+        let config = Arc::new(Config {
+            db_url: "memory://test".to_string(),
+            db_user: "root".to_string(),
+            db_pass: "root".to_string(),
+            db_namespace: "test_ns".to_string(),
+            db_database: "test_db".to_string(),
+            embedding_provider: "ollama".to_string(),
+            ollama_url: "http://localhost:11434".to_string(),
+            openai_api_key: None,
+            together_api_key: None,
+            embedding_model: "test-model".to_string(),
+            batch_size: 10,
+            pool_size: 2,
+            retry_attempts: 3,
+            retry_delay_ms: 100,
+            batch_delay_ms: 100,
+            monitoring_port: Some(9090),
+            parallel_workers: 1,
+            token_limit: 8000,
+            pool_max_size: 5,
+            pool_timeout_secs: 30,
+            pool_wait_timeout_secs: 10,
+            pool_create_timeout_secs: 30,
+            pool_recycle_timeout_secs: 30,
+        });
+
+        let pool = crate::pool::create_pool(config).await.expect("Failed to create pool");
+        
+        // Create test table
+        let conn = pool.get().await.expect("Failed to get connection");
+        conn.query("DEFINE TABLE repo SCHEMALESS").await.expect("Failed to create table");
+        
+        let client = SurrealClient::new(pool.clone());
+        (client, pool)
+    }
+
+    fn create_test_repo(id: &str, needs_embedding: bool) -> Repo {
+        let now = Utc::now();
+        Repo {
+            id: RecordId::from(("repo", id)),
+            github_id: 123456,
+            name: format!("test-{}", id),
+            full_name: format!("owner/test-{}", id),
+            description: Some("Test repository".to_string()),
+            url: format!("https://github.com/owner/test-{}", id),
+            stars: 42,
+            language: Some("Rust".to_string()),
+            owner: crate::models::RepoOwner {
+                login: "owner".to_string(),
+                avatar_url: "https://github.com/owner.png".to_string(),
+            },
+            is_private: false,
+            created_at: now,
+            updated_at: now,
+            embedding: if needs_embedding { None } else { Some(vec![0.1, 0.2, 0.3]) },
+            embedding_generated_at: if needs_embedding { None } else { Some(now) },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_repo_embedding() {
+        let (client, _pool) = setup_test_client().await;
+        
+        // Insert a test repo
+        let repo = create_test_repo("test1", true);
+        let conn = client.get_connection().await.expect("Failed to get connection");
+        let _: Option<Repo> = conn
+            .create(("repo", "test1"))
+            .content(&repo)
+            .await
+            .expect("Failed to create repo");
+        
+        // Update embedding
+        let embedding = vec![0.1, 0.2, 0.3, 0.4, 0.5];
+        let result = client.update_repo_embedding(&repo.id, embedding.clone()).await;
+        
+        assert!(result.is_ok(), "Failed to update embedding: {:?}", result.err());
+        
+        // Verify the update
+        let updated: Option<Repo> = conn
+            .select(&repo.id)
+            .await
+            .expect("Failed to select repo");
+        
+        assert!(updated.is_some());
+        let updated_repo = updated.unwrap();
+        assert_eq!(updated_repo.embedding, Some(embedding));
+        assert!(updated_repo.embedding_generated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_repos_needing_embeddings() {
+        let (client, pool) = setup_test_client().await;
+        let conn = pool.get().await.expect("Failed to get connection");
+        
+        // Insert test repos
+        let repo1 = create_test_repo("needs1", true);
+        let repo2 = create_test_repo("needs2", true);
+        let repo3 = create_test_repo("has_embedding", false);
+        
+        let _: Option<Repo> = conn.create(("repo", "needs1")).content(&repo1).await.expect("Failed to create repo");
+        let _: Option<Repo> = conn.create(("repo", "needs2")).content(&repo2).await.expect("Failed to create repo");
+        let _: Option<Repo> = conn.create(("repo", "has_embedding")).content(&repo3).await.expect("Failed to create repo");
+        
+        // Get repos needing embeddings
+        let repos = client.get_repos_needing_embeddings(10).await.expect("Failed to get repos");
+        
+        assert_eq!(repos.len(), 2);
+        assert!(repos.iter().any(|r| r.full_name == "owner/test-needs1"));
+        assert!(repos.iter().any(|r| r.full_name == "owner/test-needs2"));
+        assert!(!repos.iter().any(|r| r.full_name == "owner/test-has_embedding"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_update_embeddings() {
+        let (client, pool) = setup_test_client().await;
+        let conn = pool.get().await.expect("Failed to get connection");
+        
+        // Insert test repos
+        let repo1 = create_test_repo("batch1", true);
+        let repo2 = create_test_repo("batch2", true);
+        
+        let _: Option<Repo> = conn.create(("repo", "batch1")).content(&repo1).await.expect("Failed to create repo");
+        let _: Option<Repo> = conn.create(("repo", "batch2")).content(&repo2).await.expect("Failed to create repo");
+        
+        // Prepare batch updates
+        let updates = vec![
+            EmbeddingUpdate {
+                repo_id: repo1.id.clone(),
+                embedding: vec![0.1, 0.2, 0.3],
+            },
+            EmbeddingUpdate {
+                repo_id: repo2.id.clone(),
+                embedding: vec![0.4, 0.5, 0.6],
+            },
+        ];
+        
+        // Perform batch update
+        let result = client.batch_update_embeddings(updates).await.expect("Batch update failed");
+        
+        assert_eq!(result.total, 2);
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed, 0);
+        
+        // Verify updates
+        let updated1: Option<Repo> = conn.select(&repo1.id).await.expect("Failed to select repo");
+        let updated2: Option<Repo> = conn.select(&repo2.id).await.expect("Failed to select repo");
+        
+        assert!(updated1.unwrap().embedding.is_some());
+        assert!(updated2.unwrap().embedding.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_counts() {
+        let (client, pool) = setup_test_client().await;
+        let conn = pool.get().await.expect("Failed to get connection");
+        
+        // Insert test repos
+        let repo1 = create_test_repo("count1", true);
+        let repo2 = create_test_repo("count2", false);
+        let repo3 = create_test_repo("count3", true);
+        
+        let _: Option<Repo> = conn.create(("repo", "count1")).content(&repo1).await.expect("Failed to create repo");
+        let _: Option<Repo> = conn.create(("repo", "count2")).content(&repo2).await.expect("Failed to create repo");
+        let _: Option<Repo> = conn.create(("repo", "count3")).content(&repo3).await.expect("Failed to create repo");
+        
+        // Test counts
+        let total = client.get_total_repos_count().await.expect("Failed to get total count");
+        let embedded = client.get_embedded_repos_count().await.expect("Failed to get embedded count");
+        let pending = client.get_pending_repos_count().await.expect("Failed to get pending count");
+        
+        assert_eq!(total, 3);
+        assert_eq!(embedded, 1);
+        assert_eq!(pending, 2);
+    }
+
+    #[tokio::test]
+    async fn test_empty_batch_update() {
+        let (client, _pool) = setup_test_client().await;
+        
+        // Test empty batch
+        let result = client.batch_update_embeddings(vec![]).await.expect("Empty batch update failed");
+        
+        assert_eq!(result.total, 0);
+        assert_eq!(result.successful, 0);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_stats() {
+        let (client, _pool) = setup_test_client().await;
+        
+        let stats = client.get_pool_stats();
+        assert!(stats.max_size > 0);
+        assert!(stats.size <= stats.max_size);
+    }
 }

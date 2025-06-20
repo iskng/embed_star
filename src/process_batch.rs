@@ -169,3 +169,238 @@ pub async fn process_batch(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config,
+        embedder::Embedder,
+        models::{Repo, RepoOwner},
+        pool::create_pool,
+        surreal_client::SurrealClient,
+        validation::ValidationConfig,
+    };
+    use chrono::Utc;
+    use surrealdb::RecordId;
+    use std::sync::Arc;
+
+    async fn setup_test_environment() -> (
+        Arc<SurrealClient>,
+        Arc<Embedder>,
+        Arc<RateLimiterManager>,
+        Arc<CircuitBreakerManager>,
+        Arc<EmbeddingValidator>,
+        Arc<EmbeddingCache>,
+        RetryConfig,
+    ) {
+        let config = Arc::new(Config {
+            db_url: "memory://test".to_string(),
+            db_user: "root".to_string(),
+            db_pass: "root".to_string(),
+            db_namespace: "test_ns".to_string(),
+            db_database: "test_db".to_string(),
+            embedding_provider: "ollama".to_string(),
+            ollama_url: "http://localhost:11434".to_string(),
+            openai_api_key: None,
+            together_api_key: None,
+            embedding_model: "test-model".to_string(),
+            batch_size: 10,
+            pool_size: 2,
+            retry_attempts: 1,
+            retry_delay_ms: 10,
+            batch_delay_ms: 100,
+            monitoring_port: Some(9090),
+            parallel_workers: 1,
+            token_limit: 8000,
+            pool_max_size: 5,
+            pool_timeout_secs: 30,
+            pool_wait_timeout_secs: 10,
+            pool_create_timeout_secs: 30,
+            pool_recycle_timeout_secs: 30,
+        });
+
+        let pool = create_pool(config.clone()).await.expect("Failed to create pool");
+        let conn = pool.get().await.expect("Failed to get connection");
+        conn.query("DEFINE TABLE repo SCHEMALESS").await.expect("Failed to create table");
+
+        let client = Arc::new(SurrealClient::new(pool));
+        let embedder = Arc::new(Embedder::new(config.clone()).expect("Failed to create embedder"));
+        let rate_limiter = Arc::new(RateLimiterManager::new());
+        let circuit_breaker = Arc::new(CircuitBreakerManager::new());
+        let validator = Arc::new(EmbeddingValidator::new(ValidationConfig::default()));
+        let cache = Arc::new(EmbeddingCache::new(100, 3600));
+        let retry_config = RetryConfig::default();
+
+        (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config)
+    }
+
+    fn create_test_repo(id: &str) -> Repo {
+        let now = Utc::now();
+        Repo {
+            id: RecordId::from(("repo", id)),
+            github_id: 123456,
+            name: format!("test-{}", id),
+            full_name: format!("owner/test-{}", id),
+            description: Some("Test repository for batch processing".to_string()),
+            url: format!("https://github.com/owner/test-{}", id),
+            stars: 42,
+            language: Some("Rust".to_string()),
+            owner: RepoOwner {
+                login: "owner".to_string(),
+                avatar_url: "https://github.com/owner.png".to_string(),
+            },
+            is_private: false,
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_generated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_empty_batch() {
+        let (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config) = 
+            setup_test_environment().await;
+
+        let batch: Vec<Repo> = vec![];
+        
+        // Should complete without errors
+        process_batch(
+            &batch,
+            &client,
+            &embedder,
+            &rate_limiter,
+            &circuit_breaker,
+            &validator,
+            &cache,
+            &retry_config,
+        ).await;
+    }
+
+    #[tokio::test] 
+    async fn test_process_batch_with_cache_hit() {
+        let (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config) = 
+            setup_test_environment().await;
+
+        let repo = create_test_repo("cached");
+        let batch = vec![repo.clone()];
+        
+        // Pre-populate cache
+        let cache_key = EmbeddingCache::cache_key(&repo.full_name, embedder.model_name());
+        cache.put(cache_key, vec![0.1, 0.2, 0.3], embedder.model_name().to_string());
+        
+        // Process batch - should use cached embedding
+        process_batch(
+            &batch,
+            &client,
+            &embedder,
+            &rate_limiter,
+            &circuit_breaker,
+            &validator,
+            &cache,
+            &retry_config,
+        ).await;
+        
+        // Verify the update was made
+        let conn = client.get_connection().await.expect("Failed to get connection");
+        let updated: Option<Repo> = conn.select(&repo.id).await.expect("Failed to select repo");
+        
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().embedding, Some(vec![0.1, 0.2, 0.3]));
+    }
+
+    #[tokio::test]
+    async fn test_process_single_repo() {
+        let (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config) = 
+            setup_test_environment().await;
+
+        // Insert test repo into database
+        let repo = create_test_repo("single");
+        let conn = client.get_connection().await.expect("Failed to get connection");
+        let _: Option<Repo> = conn
+            .create(("repo", "single"))
+            .content(&repo)
+            .await
+            .expect("Failed to create repo");
+
+        let batch = vec![repo.clone()];
+        
+        // Mock embedder would be ideal here, but for now we'll just run it
+        // In a real test environment, you'd mock the embedder to return predictable results
+        
+        process_batch(
+            &batch,
+            &client,
+            &embedder,
+            &rate_limiter,
+            &circuit_breaker,
+            &validator,
+            &cache,
+            &retry_config,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn test_process_multiple_repos() {
+        let (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config) = 
+            setup_test_environment().await;
+
+        // Insert test repos
+        let conn = client.get_connection().await.expect("Failed to get connection");
+        let mut batch = Vec::new();
+        
+        for i in 0..3 {
+            let repo = create_test_repo(&format!("multi{}", i));
+            let _: Option<Repo> = conn
+                .create(("repo", format!("multi{}", i)))
+                .content(&repo)
+                .await
+                .expect("Failed to create repo");
+            batch.push(repo);
+        }
+        
+        process_batch(
+            &batch,
+            &client,
+            &embedder,
+            &rate_limiter,
+            &circuit_breaker,
+            &validator,
+            &cache,
+            &retry_config,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn test_batch_update_reporting() {
+        let (client, embedder, rate_limiter, circuit_breaker, validator, cache, retry_config) = 
+            setup_test_environment().await;
+
+        // Create repos with mixed states
+        let conn = client.get_connection().await.expect("Failed to get connection");
+        
+        let repo1 = create_test_repo("update1");
+        let _: Option<Repo> = conn.create(("repo", "update1")).content(&repo1).await.expect("Failed to create repo");
+        
+        let repo2 = create_test_repo("update2");
+        let _: Option<Repo> = conn.create(("repo", "update2")).content(&repo2).await.expect("Failed to create repo");
+        
+        // Pre-cache one to simulate mixed processing
+        let cache_key = EmbeddingCache::cache_key(&repo1.full_name, embedder.model_name());
+        cache.put(cache_key, vec![0.1, 0.2, 0.3], embedder.model_name().to_string());
+        
+        let batch = vec![repo1, repo2];
+        
+        process_batch(
+            &batch,
+            &client,
+            &embedder,
+            &rate_limiter,
+            &circuit_breaker,
+            &validator,
+            &cache,
+            &retry_config,
+        ).await;
+    }
+}

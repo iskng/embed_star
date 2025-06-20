@@ -65,13 +65,21 @@ impl EmbeddingValidator {
             )));
         }
 
-        // Check for finite values
+        // Check for finite values (NaN and Inf)
         if self.config.check_finite {
             for (i, &value) in embedding.iter().enumerate() {
-                if !value.is_finite() {
+                if value.is_nan() {
                     return Err(EmbedError::ValidationError(format!(
-                        "Non-finite value {} at index {} for {}",
-                        value, i, source
+                        "NaN value at index {} for {}",
+                        i, source
+                    )));
+                }
+                if value.is_infinite() {
+                    return Err(EmbedError::ValidationError(format!(
+                        "Infinite value ({}) at index {} for {}",
+                        if value.is_sign_positive() { "+Inf" } else { "-Inf" },
+                        i, 
+                        source
                     )));
                 }
             }
@@ -350,5 +358,86 @@ mod tests {
         // Orthogonal vectors should have similarity 0.0
         let sim2 = validator.cosine_similarity(&a, &c).unwrap();
         assert!(sim2.abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_nan_validation() {
+        let validator = EmbeddingValidator::new(ValidationConfig {
+            check_finite: true,
+            ..Default::default()
+        });
+
+        // Test NaN detection
+        let mut embedding = vec![0.1; 100];
+        embedding[50] = f32::NAN;
+        
+        let result = validator.validate(&embedding, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("NaN value at index 50"));
+    }
+
+    #[test]
+    fn test_infinity_validation() {
+        let validator = EmbeddingValidator::new(ValidationConfig {
+            check_finite: true,
+            ..Default::default()
+        });
+
+        // Test positive infinity
+        let mut embedding = vec![0.1; 100];
+        embedding[25] = f32::INFINITY;
+        
+        let result = validator.validate(&embedding, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("+Inf"));
+        assert!(err.to_string().contains("at index 25"));
+
+        // Test negative infinity
+        let mut embedding2 = vec![0.1; 100];
+        embedding2[75] = f32::NEG_INFINITY;
+        
+        let result2 = validator.validate(&embedding2, "test");
+        assert!(result2.is_err());
+        let err2 = result2.unwrap_err();
+        assert!(err2.to_string().contains("-Inf"));
+        assert!(err2.to_string().contains("at index 75"));
+    }
+
+    #[test]
+    fn test_finite_check_disabled() {
+        let validator = EmbeddingValidator::new(ValidationConfig {
+            check_finite: false,
+            ..Default::default()
+        });
+
+        // With check_finite disabled, NaN and Inf should pass
+        let mut embedding = vec![0.1; 100];
+        embedding[10] = f32::NAN;
+        embedding[20] = f32::INFINITY;
+        embedding[30] = f32::NEG_INFINITY;
+        
+        // This should not error because check_finite is false
+        assert!(validator.validate(&embedding, "test").is_ok());
+    }
+
+    #[test]
+    fn test_mixed_invalid_values() {
+        let validator = EmbeddingValidator::new(ValidationConfig {
+            check_finite: true,
+            ..Default::default()
+        });
+
+        // Test that validation stops at first invalid value
+        let mut embedding = vec![0.1; 100];
+        embedding[10] = f32::NAN;
+        embedding[20] = f32::INFINITY; // This won't be checked because validation stops at NaN
+        
+        let result = validator.validate(&embedding, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Should report the first error (NaN at index 10)
+        assert!(err.to_string().contains("NaN value at index 10"));
     }
 }

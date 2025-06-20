@@ -213,7 +213,7 @@ impl Embedder {
                 );
                 Box::new(OpenAIEmbedder::new(api_key, config.embedding_model.clone())?)
             }
-            "together" | "togetherai" => {
+            "together" => {
                 let api_key = config
                     .together_api_key
                     .as_ref()
